@@ -1,0 +1,5 @@
+AppDir/
+build/
+dist/
+.venv/
+*.spec
