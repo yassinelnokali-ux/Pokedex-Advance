@@ -1,19 +1,3 @@
-"""
-TURTLE POKeDEX ADVANCE
-======================
-A GBA-style Pokedex + trainer accounts + real turn-based battles.
-
-* Live data + sprites from PokeAPI (internet needed the first time; cached after).
-* Trainer accounts: team of 6, box, wins/losses, trainer card with badges.
-* TRAINER BATTLE: pick Trainer 1 and Trainer 2 (each needs their account
-  password) and fight on one computer, or fight the RIVAL (CPU).
-  Level 50 stats, damage formula, STAB, type chart, crits, PP, priority,
-  Potions, switching, GBA-style battle screen with sprites and HP bars.
-* Pokedex lookup, weakness checker, battle advisor, browse all Pokemon.
-
-Run:  python3 turtle_pokedex.py      (needs python3-tkinter)
-Data is saved in  ~/.turtle_pokedex/
-"""
 import base64
 import difflib
 import hashlib
@@ -31,9 +15,6 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-# --------------------------------------------------------------------------
-# Storage
-# --------------------------------------------------------------------------
 API = "https://pokeapi.co/api/v2"
 SPRITES = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/"
 HOME = os.path.join(os.path.expanduser("~"), ".turtle_pokedex")
@@ -61,14 +42,11 @@ def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 100_000).hex()
 
 
-# --------------------------------------------------------------------------
-# Type chart (attacker -> defender multipliers, Gen 6+ rules)
-# --------------------------------------------------------------------------
 TYPES = ["normal", "fire", "water", "electric", "grass", "ice", "fighting",
          "poison", "ground", "flying", "psychic", "bug", "rock", "ghost",
          "dragon", "dark", "steel", "fairy"]
 
-_RAW = {  # attacker: (super effective, not very effective, no effect)
+_RAW = {
     "normal":   ("", "rock steel", "ghost"),
     "fire":     ("grass ice bug steel", "fire water rock dragon", ""),
     "water":    ("fire ground rock", "water grass dragon", ""),
@@ -117,9 +95,6 @@ def weakness_table(defender_types):
     return {a: eff(a, defender_types) for a in TYPES}
 
 
-# --------------------------------------------------------------------------
-# PokeAPI access (with on-disk cache)
-# --------------------------------------------------------------------------
 class NotFound(Exception):
     pass
 
@@ -152,8 +127,11 @@ def cache_load(name):
 
 
 def cache_save(name, data):
-    with open(os.path.join(CACHE, name), "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    try:
+        with open(os.path.join(CACHE, name), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
 
 
 def get_pokemon(query):
@@ -167,7 +145,7 @@ def get_pokemon(query):
         last = None
         for d in m["version_group_details"]:
             if d["move_learn_method"]["name"] == "level-up":
-                last = d["level_learned_at"]  # ends as the newest game's level
+                last = d["level_learned_at"]
         if last is not None:
             level_moves[m["move"]["name"]] = last
     data = {
@@ -229,7 +207,6 @@ def all_pokemon_names():
 
 
 def get_sprite_bytes(pid, back):
-    """PNG bytes. Uses the GBA (FireRed/LeafGreen) sprites for Gen 1-3."""
     fn = os.path.join(CACHE, "sp_%s_%s.png" % (pid, "b" if back else "f"))
     if os.path.exists(fn):
         with open(fn, "rb") as f:
@@ -244,17 +221,17 @@ def get_sprite_bytes(pid, back):
             req = urllib.request.Request(u, headers={"User-Agent": "turtle-pokedex"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
-            with open(fn, "wb") as f:
-                f.write(data)
+            try:
+                with open(fn, "wb") as f:
+                    f.write(data)
+            except OSError:
+                pass
             return data
         except Exception:
             continue
     return None
 
 
-# --------------------------------------------------------------------------
-# Battle advisor logic (unchanged)
-# --------------------------------------------------------------------------
 def rank_team(team, opp):
     rows = []
     for p in team:
@@ -281,7 +258,7 @@ def best_moves(p, opp, count=4):
         scored.append((m["power"] * acc * mult * stab * stat / 100, m, mult))
     scored.sort(key=lambda r: -r[0])
     picked, used = [], set()
-    for s in scored:  # prefer variety of move types
+    for s in scored:
         if s[1]["type"] not in used or len(picked) >= 2:
             picked.append(s)
             used.add(s[1]["type"])
@@ -290,11 +267,8 @@ def best_moves(p, opp, count=4):
     return picked
 
 
-# --------------------------------------------------------------------------
-# Battle engine (rules only - no drawing in this section)
-# --------------------------------------------------------------------------
 LEVEL = 50
-BAD_MOVES = {  # moves that need special rules we don't simulate
+BAD_MOVES = {
     "explosion", "self-destruct", "misty-explosion", "final-gambit", "memento",
     "hyper-beam", "giga-impact", "blast-burn", "hydro-cannon", "frenzy-plant",
     "roar-of-time", "rock-wrecker", "prismatic-laser", "meteor-assault", "eternabeam",
@@ -312,7 +286,6 @@ STRUGGLE = {"name": "struggle", "type": "normal", "power": 50, "acc": None,
 
 
 def pick_moveset(p, level=LEVEL):
-    """Four damaging moves, like a game would give: level-up moves first."""
     learned = [n for n, lv in p.get("level_moves", []) if lv <= level]
     pool = get_moves(learned)
 
@@ -320,7 +293,7 @@ def pick_moveset(p, level=LEVEL):
         return [m for m in ms if m["power"] and m["class"] != "status"
                 and m["name"] not in BAD_MOVES]
     dmg = damaging(pool)
-    if len(dmg) < 4:  # top up from TM/tutor/egg moves
+    if len(dmg) < 4:
         have = set(learned)
         dmg += damaging(get_moves([n for n in p["moves"] if n not in have][:70]))
 
@@ -328,7 +301,7 @@ def pick_moveset(p, level=LEVEL):
         return m["power"] * (m["accuracy"] or 100) / 100 * (1.5 if m["type"] in p["types"] else 1)
     dmg.sort(key=score, reverse=True)
     chosen, per_type = [], {}
-    for m in dmg:  # max two moves of the same type
+    for m in dmg:
         if per_type.get(m["type"], 0) < 2:
             chosen.append(m)
             per_type[m["type"]] = per_type.get(m["type"], 0) + 1
@@ -396,9 +369,6 @@ def replacement_score(m, foe):
     return off * 2 - dfn * 1.5 + m["hp"] / m["maxhp"]
 
 
-# --------------------------------------------------------------------------
-# Turtle UI helpers
-# --------------------------------------------------------------------------
 W, H = 980, 720
 UI_FONT = "Arial"
 GBA_FONT = "Courier"
@@ -407,7 +377,7 @@ pen = writer = bg_t = hud_t = box_t = dlg_t = mnu_t = None
 buttons = []
 modal = None
 busy = False
-user = None  # logged-in trainer name
+user = None
 sprite_items = []
 IMGS = {}
 
@@ -435,7 +405,6 @@ def pretty(s):
 
 
 def rect(x, y, w, h, fill, outline="black", t=None, width=1):
-    """Rectangle with bottom-left corner at (x, y)."""
     t = t or pen
     t.goto(x, y)
     t.setheading(0)
@@ -495,7 +464,6 @@ def clear_all():
 
 
 def page(title, subtitle=""):
-    """Clear the screen and draw the GBA-style menu frame."""
     clear_all()
     screen.bgcolor("#3050a0")
     rect(-W / 2 + 14, -H / 2 + 14, W - 28, H - 28, "#f8f8e8", "#182030", width=6)
@@ -512,7 +480,7 @@ def finish():
 
 def on_click(x, y):
     global busy
-    if modal is not None:  # a battle menu is waiting for a click
+    if modal is not None:
         for x1, y1, x2, y2, val in modal["hits"]:
             if x1 <= x <= x2 and y1 <= y <= y2:
                 modal["val"] = val
@@ -527,8 +495,8 @@ def on_click(x, y):
             try:
                 cb()
             except (turtle.Terminator, tk.TclError):
-                pass  # window was closed
-            except Exception as e:  # never crash the window
+                pass
+            except Exception as e:
                 try:
                     notice("Something went wrong", [str(e)[:110]],
                            menu if user else login_screen)
@@ -585,7 +553,6 @@ def notice(title, lines, back):
 
 
 def lookup(query):
-    """Get a Pokemon, with helpful errors (spell-check suggestions, offline)."""
     try:
         query = query.strip()
         if not query:
@@ -600,17 +567,17 @@ def lookup(query):
             close = []
         raise RuntimeError("Not found: '%s'. %s" % (
             query, ("Did you mean: " + ", ".join(close)) if close else "Check the spelling."))
-    except (urllib.error.URLError, OSError):
-        raise RuntimeError("No internet connection and '%s' is not cached yet." % query)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("PokeAPI returned HTTP %d for '%s'." % (e.code, query))
+    except (urllib.error.URLError, OSError) as e:
+        reason = str(getattr(e, "reason", e))[:90]
+        raise RuntimeError("Could not get '%s' (not cached yet): %s" % (query, reason))
 
 
-# --------------------------------------------------------------------------
-# GBA battle screen
-# --------------------------------------------------------------------------
 SIDES = []
 PVP = False
-ITEM = [None, None]  # canvas image ids of the two sprites
-SLOT = {0: (-240, -30), 1: (250, 150)}  # sprite centres (player bottom-left, foe top-right)
+ITEM = [None, None]
+SLOT = {0: (-240, -30), 1: (250, 150)}
 
 
 def hp_color(f):
@@ -658,7 +625,7 @@ def show_active(i):
     if img is not None:
         ITEM[i] = cv.create_image(x, -y, image=img)
         sprite_items.append(ITEM[i])
-    else:  # no sprite available: coloured blob
+    else:
         ITEM[i] = None
         ellipse(bg_t, x, y, 70, 60, TYPE_COLORS.get(m["types"][0], "#999"), "#202020", 4)
     SIDES[i]["shown"] = True
@@ -726,7 +693,6 @@ def box_split():
 
 
 def say(msg, hold=0.9):
-    """GBA typewriter message in the bottom box."""
     mnu_t.clear()
     box_full()
     lines = textwrap.wrap(msg, 46) or [""]
@@ -753,7 +719,6 @@ def prompt_left(lines):
 
 
 def choose(items, x0, ytop, bw, bh, gap=6, cols=2, extra=()):
-    """Draw menu buttons in the bottom box and wait for a click. Returns the value."""
     mnu_t.clear()
     hits = []
     for k, it in enumerate(items):
@@ -1034,7 +999,6 @@ def resolve(acts):
 
 
 def run_battle(s0, s1):
-    """Returns the index (0 or 1) of the winning side."""
     global SIDES, PVP
     SIDES = [s0, s1]
     PVP = not (s0["cpu"] or s1["cpu"])
@@ -1064,9 +1028,6 @@ def run_battle(s0, s1):
                 send_out(i, pick_replacement(i))
 
 
-# --------------------------------------------------------------------------
-# Screens: title, login, menu
-# --------------------------------------------------------------------------
 def pokeball(cx, cy, r):
     t = pen
     t.pensize(5)
@@ -1107,7 +1068,7 @@ def title_screen():
     user = None
     clear_all()
     screen.bgcolor("#1c2c68")
-    for k in range(0, 720, 60):  # GBA-ish stripes
+    for k in range(0, 720, 60):
         rect(-W / 2, -360 + k, W, 30, "#243a80", "#243a80")
     pokeball(0, 90, 120)
     text(4, 232, "POK\u00e9DEX", 54, "#202020", True, "center", font=GBA_FONT)
@@ -1216,7 +1177,6 @@ def trainer_card():
     finish()
 
 
-# ---- Pokedex ------------------------------------------------------------
 def dex_prompt():
     q = ask("Pokedex", "Pokemon name or number (e.g. pikachu or 25):")
     if q:
@@ -1297,7 +1257,6 @@ def add_to(where, name):
     notice("Saved!", [pretty(name) + " was added to your " + where + "."], menu)
 
 
-# ---- Weakness checker ---------------------------------------------------
 def weakness_prompt():
     q = ask("Weakness checker", "Pokemon name or number:")
     if q:
@@ -1332,7 +1291,6 @@ def show_weakness(q):
     finish()
 
 
-# ---- Team ---------------------------------------------------------------
 def team_screen():
     if user == "guest":
         return notice("Guest mode", ["Create an account to keep a team and box."], menu)
@@ -1413,7 +1371,6 @@ def remove_from(where):
         notice("Not found", [pretty(n) + " is not in your " + where + "."], team_screen)
 
 
-# ---- Browse -------------------------------------------------------------
 def browse_screen(start=0):
     page("BROWSE ALL POKEMON", "Trainer: " + user)
     loading()
@@ -1435,7 +1392,6 @@ def browse_screen(start=0):
     finish()
 
 
-# ---- Battle advisor -----------------------------------------------------
 def battle_prompt():
     if user == "guest":
         return notice("Guest mode", ["Create an account so the advisor can use your team."], menu)
@@ -1496,8 +1452,7 @@ def battle(q):
     finish()
 
 
-# ---- Trainer battle setup ----------------------------------------------
-BS = {"p1": None, "p2": None}  # ("acct", name) or ("cpu", "RIVAL")
+BS = {"p1": None, "p2": None}
 
 
 def open_battle_setup():
@@ -1620,9 +1575,10 @@ def start_battle():
         preload_sprites([s0, s1])
     except RuntimeError as e:
         return notice("Cannot start", [str(e)], battle_setup)
-    except Exception:
-        return notice("Offline", ["Battles need internet the first time to fetch Pokemon and",
-                                  "moves. After that they are cached."], battle_setup)
+    except Exception as e:
+        return notice("Could not load data", ["Battles need internet the first time to fetch Pokemon and",
+                                              "moves. After that they are cached.",
+                                              str(e)[:100]], battle_setup)
     winner = run_battle(s0, s1)
     record_result(p1, p2, winner)
     result_screen(p1, p2, winner)
