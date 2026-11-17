@@ -100,14 +100,42 @@ class NotFound(Exception):
 
 
 def http_json(path):
-    req = urllib.request.Request(API + path, headers={"User-Agent": "turtle-pokedex"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise NotFound(path)
-        raise
+    url = API + path
+    last_error = None
+
+    for attempt in range(5):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "TurtlePokedexAdvance/1.0",
+                "Accept": "application/json",
+                "Connection": "close",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise NotFound(path)
+            if e.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            last_error = e
+            retry_after = e.headers.get("Retry-After")
+            try:
+                delay = min(float(retry_after), 20) if retry_after else min(2 ** attempt, 16)
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 16)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_error = e
+            delay = min(2 ** attempt, 16)
+
+        if attempt < 4:
+            time.sleep(delay + random.uniform(0, 0.5))
+
+    raise urllib.error.URLError(
+        "PokeAPI connection failed after 5 attempts: %s" % last_error
+    )
 
 
 def norm(q):
@@ -192,7 +220,7 @@ def get_moves(names):
             return get_move(n)
         except Exception:
             return None
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         return [m for m in ex.map(safe, names[:250]) if m]
 
 
