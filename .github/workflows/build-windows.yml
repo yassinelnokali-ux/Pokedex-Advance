@@ -1,3 +1,4 @@
+
 name: Build Windows EXE
 
 on:
@@ -21,7 +22,7 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name PokedexAdvance pokedex.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name PokedexAdvance --icon=assets/icon.ico pokedex.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
