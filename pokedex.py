@@ -1,4 +1,5 @@
 import base64
+import datetime
 import difflib
 import hashlib
 import json
@@ -7,20 +8,25 @@ import os
 import random
 import re
 import secrets
+import subprocess
+import sys
 import textwrap
 import time
 import tkinter as tk
 import turtle
 import urllib.error
+import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+import webbrowser
 
 API = "https://pokeapi.co/api/v2"
 SPRITES = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/"
 HOME = os.path.join(os.path.expanduser("~"), ".turtle_pokedex")
 CACHE = os.path.join(HOME, "cache")
 DB_FILE = os.path.join(HOME, "trainers.json")
+MUSIC_DIR = os.path.join(HOME, "music")
 os.makedirs(CACHE, exist_ok=True)
+os.makedirs(MUSIC_DIR, exist_ok=True)
 
 
 def load_db():
@@ -99,11 +105,27 @@ class NotFound(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Networking: one request at a time, with a small gap between requests.
+# Everything that was fetched once is saved to disk and reused afterwards.
+# ---------------------------------------------------------------------------
+_last_call = [0.0]
+
+
+def throttle(gap=0.2):
+    wait = gap - (time.time() - _last_call[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_call[0] = time.time()
+
+
 def http_json(path):
     url = API + path
     last_error = None
+    delay = 1
 
     for attempt in range(5):
+        throttle()
         req = urllib.request.Request(
             url,
             headers={
@@ -126,7 +148,8 @@ def http_json(path):
                 delay = min(float(retry_after), 20) if retry_after else min(2 ** attempt, 16)
             except (TypeError, ValueError):
                 delay = min(2 ** attempt, 16)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
+                json.JSONDecodeError) as e:
             last_error = e
             delay = min(2 ** attempt, 16)
 
@@ -162,10 +185,17 @@ def cache_save(name, data):
         pass
 
 
+POKE_MEM = {}
+MOVE_MEM = {}
+
+
 def get_pokemon(query):
     q = norm(query)
+    if q in POKE_MEM:
+        return POKE_MEM[q]
     data = cache_load(f"pk2_{q}.json")
     if data:
+        POKE_MEM[q] = data
         return data
     raw = http_json(f"/pokemon/{q}")
     level_moves = {}
@@ -189,16 +219,21 @@ def get_pokemon(query):
         "level_moves": sorted(level_moves.items(), key=lambda kv: kv[1]),
         "games": sorted({g["version"]["name"] for g in raw.get("game_indices", [])}),
         "past_types": [[p["generation"]["name"], [t["type"]["name"] for t in p["types"]]]
-                      for p in raw.get("past_types", [])],
+                       for p in raw.get("past_types", [])],
     }
     cache_save(f"pk2_{data['name']}.json", data)
     cache_save(f"pk2_{q}.json", data)
+    POKE_MEM[q] = data
+    POKE_MEM[data["name"]] = data
     return data
 
 
 def get_move(name):
+    if name in MOVE_MEM:
+        return MOVE_MEM[name]
     data = cache_load(f"mv2_{name}.json")
     if data:
+        MOVE_MEM[name] = data
         return data
     raw = http_json(f"/move/{name}")
     data = {
@@ -211,17 +246,19 @@ def get_move(name):
         "class": raw["damage_class"]["name"],
     }
     cache_save(f"mv2_{name}.json", data)
+    MOVE_MEM[name] = data
     return data
 
 
-def get_moves(names):
-    def safe(n):
+def get_moves(names, limit=80):
+    """Fetch moves ONE AT A TIME. Cached moves come from memory/disk."""
+    out = []
+    for n in names[:limit]:
         try:
-            return get_move(n)
+            out.append(get_move(n))
         except Exception:
-            return None
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        return [m for m in ex.map(safe, names[:250]) if m]
+            continue
+    return out
 
 
 def all_pokemon_names():
@@ -232,6 +269,70 @@ def all_pokemon_names():
     names = [p["name"] for p in raw["results"]]
     cache_save("all_names.json", names)
     return names
+
+
+REGIONS = ["kanto", "johto", "hoenn", "sinnoh", "unova", "kalos", "alola", "galar"]
+
+
+def get_region_locations(region):
+    data = cache_load("rg_%s.json" % region)
+    if data:
+        return data
+    raw = http_json("/region/%s" % region)
+    names = [l["name"] for l in raw["locations"]]
+    cache_save("rg_%s.json" % region, names)
+    return names
+
+
+def _num_key(n):
+    d = re.findall(r"\d+", n)
+    return (int(d[0]) if d else 999, n)
+
+
+def region_routes(region):
+    names = [n for n in get_region_locations(region) if re.search(r"(^|-)route-\d+", n)]
+    return sorted(names, key=_num_key)
+
+
+def find_route(region, num):
+    pat = re.compile(r"(^|-)route-%d($|-)" % num)
+    hits = sorted((n for n in get_region_locations(region) if pat.search(n)), key=len)
+    if not hits:
+        raise NotFound("route %d" % num)
+    return hits[0]
+
+
+def get_route(loc):
+    """Wild Pokemon of a route. Areas are fetched one at a time and cached."""
+    data = cache_load("rt_%s.json" % loc)
+    if data:
+        return data
+    raw = http_json("/location/%s" % loc)
+    areas = []
+    for a in raw.get("areas", [])[:4]:
+        ar = http_json("/location-area/%s" % a["name"])
+        enc = {}
+        for pe in ar["pokemon_encounters"]:
+            pname = pe["pokemon"]["name"]
+            e = enc.setdefault(pname, {"name": pname, "methods": [], "min": 999,
+                                       "max": 0, "chance": 0, "games": []})
+            for vd in pe["version_details"]:
+                g = vd["version"]["name"]
+                if g not in e["games"]:
+                    e["games"].append(g)
+                for d in vd["encounter_details"]:
+                    m = d["method"]["name"]
+                    if m not in e["methods"]:
+                        e["methods"].append(m)
+                    e["min"] = min(e["min"], d["min_level"])
+                    e["max"] = max(e["max"], d["max_level"])
+                    e["chance"] = max(e["chance"], d["chance"])
+        rows = sorted(enc.values(), key=lambda e: (-e["chance"], e["name"]))
+        areas.append({"name": a["name"], "rows": rows})
+    region = raw.get("region")
+    data = {"name": raw["name"], "region": region["name"] if region else "", "areas": areas}
+    cache_save("rt_%s.json" % loc, data)
+    return data
 
 
 def get_sprite_bytes(pid, back):
@@ -246,6 +347,7 @@ def get_sprite_bytes(pid, back):
     urls.append(SPRITES + "%s%d.png" % (sub, pid))
     for u in urls:
         try:
+            throttle(0.1)
             req = urllib.request.Request(u, headers={"User-Agent": "turtle-pokedex"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
@@ -276,7 +378,7 @@ def rank_team(team, opp):
 
 def best_moves(p, opp, count=4):
     scored = []
-    for m in get_moves(p["moves"]):
+    for m in get_moves(p["moves"], 80):
         if not m["power"] or m["class"] == "status":
             continue
         mult = eff(m["type"], opp["types"])
@@ -315,7 +417,7 @@ STRUGGLE = {"name": "struggle", "type": "normal", "power": 50, "acc": None,
 
 def pick_moveset(p, level=LEVEL):
     learned = [n for n, lv in p.get("level_moves", []) if lv <= level]
-    pool = get_moves(learned)
+    pool = get_moves(learned, 60)
 
     def damaging(ms):
         return [m for m in ms if m["power"] and m["class"] != "status"
@@ -323,7 +425,7 @@ def pick_moveset(p, level=LEVEL):
     dmg = damaging(pool)
     if len(dmg) < 4:
         have = set(learned)
-        dmg += damaging(get_moves([n for n in p["moves"] if n not in have][:70]))
+        dmg += damaging(get_moves([n for n in p["moves"] if n not in have][:25], 25))
 
     def score(m):
         return m["power"] * (m["accuracy"] or 100) / 100 * (1.5 if m["type"] in p["types"] else 1)
@@ -1139,7 +1241,7 @@ def do_register():
         return notice("Too short", ["Password needs at least 4 characters."], login_screen)
     salt = secrets.token_hex(16)
     db[name] = {"salt": salt, "hash": hash_pw(pw, salt), "team": [], "box": [],
-                "wins": 0, "losses": 0}
+                "favs": [], "wins": 0, "losses": 0}
     save_db(db)
     notice("Welcome, " + name + "!", ["Account created. Log in to begin."], login_screen)
 
@@ -1167,17 +1269,23 @@ def rank_title(wins):
 
 def menu():
     page("POK\u00e9DEX", "Trainer: " + user)
-    text(0, 215, "What would you like to do?", 20, "#222", True, "center")
-    button(-150, 150, "Pokedex Lookup", dex_prompt, 270, 50)
-    button(150, 150, "Weakness Checker", weakness_prompt, 270, 50)
-    button(-150, 80, "My Team & Box", team_screen, 270, 50)
-    button(150, 80, "Battle Advisor", battle_prompt, 270, 50, "#a8e0a0")
-    button(-150, 10, "TRAINER BATTLE", open_battle_setup, 270, 50, "#f8a0a0")
-    button(150, 10, "Trainer Card", trainer_card, 270, 50, "#a8c8f8")
-    button(-150, -60, "Browse All Pokemon", browse_screen, 270, 50)
-    button(150, -60, "Log Out", title_screen, 270, 50, "#ddd")
+    text(0, 222, "What would you like to do?", 20, "#222", True, "center")
+    button(-150, 160, "Pokedex Lookup", dex_prompt, 270, 50)
+    button(150, 160, "Weakness Checker", weakness_prompt, 270, 50)
+    button(-150, 98, "My Team & Box", team_screen, 270, 50)
+    button(150, 98, "Battle Advisor", battle_prompt, 270, 50, "#a8e0a0")
+    button(-150, 36, "TRAINER BATTLE", open_battle_setup, 270, 50, "#f8a0a0")
+    button(150, 36, "Trainer Card", trainer_card, 270, 50, "#a8c8f8")
+    button(-150, -26, "Browse All Pokemon", browse_screen, 270, 50)
+    button(150, -26, "Compare Pokemon", compare_prompt, 270, 50, "#e8c8f8")
+    button(-150, -88, "Pokemon of the Day", daily_pokemon, 270, 50, "#f8e8a0")
+    button(150, -88, "Favorites", favorites_screen, 270, 50, "#f8c8d8")
+    button(-150, -150, "Route Maps", route_home, 270, 50, "#a8e8e0")
+    button(150, -150, "Cache", cache_screen, 270, 50, "#ddd")
+    button(-150, -212, "Music", music_home, 270, 50, "#f8d0f0")
+    button(150, -212, "Log Out", title_screen, 270, 50, "#ddd")
     if user == "guest":
-        text(0, -130, "Guest mode: nothing is saved. Create an account to save and battle.",
+        text(0, -275, "Guest mode: nothing is saved. Create an account to save and battle.",
              12, "#a00", False, "center")
     finish()
 
@@ -1193,7 +1301,8 @@ def trainer_card():
     tid = int(hashlib.sha1(user.encode()).hexdigest()[:8], 16) % 100000
     rows = ["NAME   %s" % user.upper(), "ID No. %05d" % tid,
             "RANK   %s" % rank_title(wins), "BATTLES WON %d   LOST %d" % (wins, losses),
-            "TEAM %d/6   BOX %d" % (len(acct["team"]), len(acct["box"]))]
+            "TEAM %d/6   BOX %d   FAVS %d" % (len(acct["team"]), len(acct["box"]),
+                                              len(acct.get("favs", [])))]
     for k, r in enumerate(rows):
         text(-370, 130 - k * 50, r, 22, "#403000", True, font=GBA_FONT)
     text(-370, -150, "BADGES", 16, "#403000", True, font=GBA_FONT)
@@ -1268,7 +1377,12 @@ def show_pokemon(q):
     button(-110, -300, "Add to My Box", lambda: add_to("box", p["name"]), 200)
     button(110, -300, "Weaknesses", lambda: show_weakness(p["name"]), 200, 38, "#ff9f9f")
     button(330, -300, "Back", menu, 200, 38, "#ddd")
+    button(-330, -250, "Add to Favorites", lambda: add_to("favs", p["name"]), 200, 38, "#f8c8d8")
+    button(-110, -250, "Compare with...", lambda: compare_with(p["name"]), 200, 38, "#e8c8f8")
     finish()
+
+
+WHERE_LABEL = {"team": "team", "box": "box", "favs": "favorites"}
 
 
 def add_to(where, name):
@@ -1276,13 +1390,15 @@ def add_to(where, name):
         return notice("Guest mode", ["Create an account to save Pokemon."], menu)
     db = load_db()
     acct = db[user]
+    acct.setdefault(where, [])
+    label = WHERE_LABEL.get(where, where)
     if name in acct[where]:
-        return notice("Already there", [pretty(name) + " is already in your " + where + "."], menu)
+        return notice("Already there", [pretty(name) + " is already in your " + label + "."], menu)
     if where == "team" and len(acct["team"]) >= 6:
         return notice("Team full", ["Your team has 6 Pokemon. Remove one first."], team_screen)
     acct[where].append(name)
     save_db(db)
-    notice("Saved!", [pretty(name) + " was added to your " + where + "."], menu)
+    notice("Saved!", [pretty(name) + " was added to your " + label + "."], menu)
 
 
 def weakness_prompt():
@@ -1317,6 +1433,419 @@ def show_weakness(q):
     button(-110, -300, "Pokedex Entry", lambda: show_pokemon(p["name"]), 200)
     button(110, -300, "Back", menu, 200, 38, "#ddd")
     finish()
+
+
+# ---------------------------------------------------------------------------
+# NEW: compare two Pokemon
+# ---------------------------------------------------------------------------
+def compare_prompt():
+    a = ask("Compare", "First Pokemon:")
+    if not a:
+        return
+    b = ask("Compare", "Second Pokemon:")
+    if b:
+        show_compare(a, b)
+
+
+def compare_with(first):
+    b = ask("Compare", "Compare %s with which Pokemon?" % pretty(first))
+    if b:
+        show_compare(first, b)
+
+
+def show_compare(qa, qb):
+    page("COMPARE", "Trainer: " + user)
+    loading()
+    try:
+        pa, pb = lookup(qa), lookup(qb)
+    except RuntimeError as e:
+        return notice("Lookup failed", [str(e)], menu)
+    page("%s  vs  %s" % (pa["name"].upper(), pb["name"].upper()), "Trainer: " + user)
+    keys = [("hp", "HP"), ("attack", "Attack"), ("defense", "Defense"),
+            ("special-attack", "Sp. Atk"), ("special-defense", "Sp. Def"), ("speed", "Speed")]
+    for i, t in enumerate(pa["types"]):
+        badge(-440 + i * 95, 235, t)
+    for i, t in enumerate(pb["types"]):
+        badge(350 - i * 95, 235, t)
+    y = 185
+    for k, label in keys:
+        va, vb = pa["stats"][k], pb["stats"][k]
+        text(0, y, label, 13, "#222", True, "center")
+        rect(-40 - va / 255 * 380, y - 8, va / 255 * 380, 18, "#27ae60" if va >= vb else "#e74c3c")
+        rect(40, y - 8, vb / 255 * 380, 18, "#27ae60" if vb >= va else "#e74c3c")
+        text(-440, y - 4, str(va), 12, "#222", True)
+        text(440, y - 4, str(vb), 12, "#222", True, "right")
+        y -= 46
+    ta, tb = sum(pa["stats"].values()), sum(pb["stats"].values())
+    text(0, y - 10, "TOTAL: %d  vs  %d" % (ta, tb), 16, "#222", True, "center")
+    wa = max(eff(t, pb["types"]) for t in pa["types"])
+    wb = max(eff(t, pa["types"]) for t in pb["types"])
+    text(0, y - 45, "%s hits %s for x%g  |  %s hits %s for x%g" % (
+        pa["name"].upper(), pb["name"].upper(), wa, pb["name"].upper(), pa["name"].upper(), wb),
+        12, "#444", False, "center")
+    button(-110, -300, "Compare Others", compare_prompt, 200, 38, "#e8c8f8")
+    button(110, -300, "Back", menu, 200, 38, "#ddd")
+    finish()
+
+
+# ---------------------------------------------------------------------------
+# NEW: Pokemon of the day (same Pokemon all day, changes at midnight)
+# ---------------------------------------------------------------------------
+def daily_pokemon():
+    today = datetime.date.today().isoformat()
+    pid = random.Random(today).randint(1, 386)
+    show_pokemon(str(pid))
+
+
+# ---------------------------------------------------------------------------
+# NEW: favorites
+# ---------------------------------------------------------------------------
+def favorites_screen():
+    if user == "guest":
+        return notice("Guest mode", ["Create an account to keep favorites."], menu)
+    acct = load_db()[user]
+    favs = acct.get("favs", [])
+    page("%s'S FAVORITES" % user.upper(), "%d saved" % len(favs))
+    if not favs:
+        text(0, 120, "No favorites yet. Open a Pokemon and press 'Add to Favorites'.",
+             14, "#555", False, "center")
+    else:
+        text(0, 215, "Click a Pokemon to open its Pokedex entry.", 13, "#444", False, "center")
+    for k, n in enumerate(favs[:16]):
+        r, c = divmod(k, 2)
+        button(-230 + c * 460, 170 - r * 50, pretty(n), lambda n=n: show_pokemon(n), 430, 40,
+               "#f8c8d8")
+    button(-110, -300, "Remove Favorite", remove_favorite, 200, 38, "#ff9f9f")
+    button(110, -300, "Back", menu, 200, 38, "#ddd")
+    finish()
+
+
+def remove_favorite():
+    q = ask("Remove favorite", "Which Pokemon do you want to remove?")
+    if not q:
+        return
+    try:
+        n = norm(q)
+    except ValueError as e:
+        return notice("Invalid", [str(e)], favorites_screen)
+    db = load_db()
+    favs = db[user].setdefault("favs", [])
+    if n in favs:
+        favs.remove(n)
+        save_db(db)
+        favorites_screen()
+    else:
+        notice("Not found", [pretty(n) + " is not in your favorites."], favorites_screen)
+
+
+# ---------------------------------------------------------------------------
+# NEW: cache manager
+# ---------------------------------------------------------------------------
+def cache_screen():
+    try:
+        files = os.listdir(CACHE)
+    except OSError:
+        files = []
+    size = 0
+    for f in files:
+        try:
+            size += os.path.getsize(os.path.join(CACHE, f))
+        except OSError:
+            pass
+    pokes = sum(1 for f in files if f.startswith("pk2_"))
+    moves = sum(1 for f in files if f.startswith("mv2_"))
+    sprites = sum(1 for f in files if f.startswith("sp_"))
+    routes = sum(1 for f in files if f.startswith("rt_"))
+    notice("Cache", ["Saved files: %d" % len(files),
+                     "  Pokemon: %d   Moves: %d   Sprites: %d   Routes: %d" % (
+                         pokes, moves, sprites, routes),
+                     "Size: %.0f KB" % (size / 1024),
+                     "Cached Pokemon, moves and sprites work offline.",
+                     "Folder: " + CACHE], menu)
+    button(0, -230, "Clear Cache", clear_cache, 200, 38, "#ff9f9f")
+    finish()
+
+
+def clear_cache():
+    for f in os.listdir(CACHE):
+        try:
+            os.remove(os.path.join(CACHE, f))
+        except OSError:
+            pass
+    MOVE_MEM.clear()
+    POKE_MEM.clear()
+    IMGS.clear()
+    notice("Done", ["Cache cleared."], menu)
+
+
+# ---------------------------------------------------------------------------
+# NEW: route maps (wild Pokemon per route + real map in the browser)
+# ---------------------------------------------------------------------------
+def route_home():
+    page("ROUTE MAPS", "Trainer: " + user)
+    text(0, 225, "Check the Pokemon on any route, and open its map.", 15, "#222", True, "center")
+    button(0, 175, "Search a route (e.g. 104 or kanto route 1)", route_prompt, 520, 46, "#f8d860")
+    text(0, 125, "Or browse by region:", 14, "#444", False, "center")
+    for k, r in enumerate(REGIONS):
+        row, c = divmod(k, 2)
+        button(-150 + c * 300, 80 - row * 58, pretty(r), lambda r=r: route_list(r), 270, 46, "#a8e8e0")
+    button(0, -300, "Back", menu, 200, 38, "#ddd")
+    finish()
+
+
+def route_prompt():
+    q = ask("Route maps", "Route name or number (e.g. 104, hoenn route 104, kanto route 1):")
+    if not q:
+        return
+    s = q.lower()
+    region = next((r for r in REGIONS if r in s), None)
+    m = re.search(r"\d+", s)
+    if not m:
+        if region:
+            return route_list(region)
+        return notice("Invalid", ["Enter a route number like 104, or a region like Hoenn."], route_home)
+    n = int(m.group())
+    if region:
+        return show_route_by(region, n)
+    if 101 <= n <= 134:
+        return show_route_by("hoenn", n)
+    if 201 <= n <= 230:
+        return show_route_by("sinnoh", n)
+    route_pick_region(n)
+
+
+def route_pick_region(n):
+    page("ROUTE %d" % n, "Trainer: " + user)
+    text(0, 225, "Route %d exists in several regions. Which one?" % n, 16, "#222", True, "center")
+    for k, r in enumerate(REGIONS):
+        row, c = divmod(k, 2)
+        button(-150 + c * 300, 160 - row * 58, pretty(r), lambda r=r: show_route_by(r, n),
+               270, 46, "#a8e8e0")
+    button(0, -300, "Back", route_home, 200, 38, "#ddd")
+    finish()
+
+
+def route_error(e, back):
+    if isinstance(e, NotFound):
+        return notice("Not found", ["That route was not found. Try another number or region."], back)
+    reason = str(getattr(e, "reason", e))[:90]
+    return notice("Lookup failed", ["Could not load route data (not cached yet):", reason], back)
+
+
+def show_route_by(region, n):
+    page("ROUTE MAPS", "Trainer: " + user)
+    loading("Finding %s route %d..." % (pretty(region), n))
+    try:
+        loc = find_route(region, n)
+    except (NotFound, urllib.error.URLError, OSError) as e:
+        return route_error(e, route_home)
+    show_route(loc)
+
+
+def route_list(region, pg=0):
+    page("ROUTE MAPS", "Trainer: " + user)
+    loading("Loading %s routes..." % pretty(region))
+    try:
+        names = region_routes(region)
+    except (NotFound, urllib.error.URLError, OSError) as e:
+        return route_error(e, route_home)
+    if not names:
+        return notice("No routes", ["No numbered routes found for " + pretty(region) + "."], route_home)
+    per = 16
+    page("%s ROUTES" % region.upper(), "%d-%d of %d" % (
+        pg * per + 1, min((pg + 1) * per, len(names)), len(names)))
+    for k, n in enumerate(names[pg * per:(pg + 1) * per]):
+        row, c = divmod(k, 2)
+        button(-230 + c * 460, 215 - row * 50, pretty(n), lambda n=n: show_route(n), 430, 40, "#a8e8e0")
+    if pg > 0:
+        button(-330, -300, "< Prev", lambda: route_list(region, pg - 1), 150)
+    if (pg + 1) * per < len(names):
+        button(330, -300, "Next >", lambda: route_list(region, pg + 1), 150)
+    button(0, -300, "Back", route_home, 200, 38, "#ddd")
+    finish()
+
+
+def area_label(loc, name):
+    s = name.replace(loc + "-", "").replace("-area", "")
+    if s == name or not s:
+        return "Main area"
+    return pretty(s)[:24]
+
+
+def open_route_map(loc, region):
+    q = pretty(loc)
+    if region and region.lower() not in q.lower():
+        q = pretty(region) + " " + q
+    url = "https://bulbapedia.bulbagarden.net/w/index.php?search=" + urllib.parse.quote_plus(q)
+    try:
+        webbrowser.open(url)
+        msg = ["Opening the %s page on Bulbapedia in your browser." % q,
+               "It has the full map, trainers and items."]
+    except Exception:
+        msg = ["Could not open a browser. Search this on Bulbapedia:", q]
+    notice("Route map", msg, lambda: show_route(loc))
+
+
+def show_route(loc, ai=0, pg=0):
+    page("ROUTE MAPS", "Trainer: " + user)
+    loading("Loading route data...")
+    try:
+        data = get_route(loc)
+    except (NotFound, urllib.error.URLError, OSError) as e:
+        return route_error(e, route_home)
+    areas = data["areas"]
+    region = data.get("region", "")
+    page(pretty(loc).upper(), "Trainer: " + user)
+    per = 12
+    rows = []
+    if not areas:
+        text(-440, 200, "No wild Pokemon encounter data for this location.", 14, "#555")
+    else:
+        ai = max(0, min(ai, len(areas) - 1))
+        rows = areas[ai]["rows"]
+        text(-440, 235, "Region: %s    Area: %s    (%d Pokemon)" % (
+            pretty(region) if region else "-", area_label(loc, areas[ai]["name"]), len(rows)),
+            13, "#222", True)
+        methods = sorted({m for r in rows for m in r["methods"]})
+        text(-440, 210, ("Encounter types: " + ", ".join(pretty(m) for m in methods))[:115],
+             12, "#444")
+        if not rows:
+            text(-440, 170, "No wild Pokemon listed for this area.", 14, "#555")
+        else:
+            for x, h in ((-440, "POKEMON"), (-270, "HOW"), (-20, "LEVEL"), (80, "CHANCE"),
+                         (170, "GAMES")):
+                text(x, 182, h, 11, "#a00", True)
+            y = 155
+            for r in rows[pg * per:(pg + 1) * per]:
+                text(-440, y, pretty(r["name"]), 13, "#222", True)
+                text(-270, y, ", ".join(pretty(m) for m in r["methods"])[:26], 12)
+                lv = "%d-%d" % (r["min"], r["max"]) if r["min"] <= r["max"] else "-"
+                text(-20, y, "Lv " + lv, 12)
+                text(80, y, "up to %d%%" % r["chance"] if r["chance"] else "-", 12)
+                games = ", ".join(pretty(g) for g in r["games"])
+                text(170, y, games if len(games) <= 54 else games[:51] + "...", 10, "#555")
+                y -= 27
+    if len(areas) > 1:
+        for k, a in enumerate(areas[:4]):
+            button(-330 + k * 220, -245, area_label(loc, a["name"]),
+                   lambda k=k: show_route(loc, k, 0), 200, 34,
+                   "#a8e8e0" if k == ai else "#ddd")
+    if pg > 0:
+        button(-400, -300, "< Prev", lambda: show_route(loc, ai, pg - 1), 120)
+    if (pg + 1) * per < len(rows):
+        button(-270, -300, "Next >", lambda: show_route(loc, ai, pg + 1), 120)
+    button(-60, -300, "Open Map in Browser", lambda: open_route_map(loc, region), 230, 38, "#f8d860")
+    button(150, -300, "Route List", lambda: route_home(), 130, 38, "#a8e8e0")
+    button(310, -300, "Back", menu, 130, 38, "#ddd")
+    finish()
+
+
+# ---------------------------------------------------------------------------
+# NEW: music (opens official-music searches, plus a folder for your own files)
+# ---------------------------------------------------------------------------
+MUSIC_GAMES = ["Red Blue", "Gold Silver", "Ruby Sapphire", "Diamond Pearl",
+               "Black White", "X Y", "Sun Moon", "Sword Shield"]
+MUSIC_THEMES = ["Title Screen", "Route", "Wild Pokemon Battle", "Trainer Battle",
+                "Gym Leader Battle", "Champion Battle", "Pokemon Center", "Victory"]
+AUDIO_EXT = (".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac")
+
+
+def open_external(target):
+    if sys.platform.startswith("win"):
+        os.startfile(target)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
+def music_home():
+    page("MUSIC", "Trainer: " + user)
+    text(0, 225, "Listen to the original Pokemon music", 18, "#222", True, "center")
+    button(0, 185, "Search any theme (e.g. Lavender Town)", music_prompt, 520, 46, "#f8d860")
+    text(0, 140, "Or pick a game:", 14, "#444", False, "center")
+    for k, g in enumerate(MUSIC_GAMES):
+        row, c = divmod(k, 2)
+        button(-150 + c * 300, 95 - row * 58, g.replace(" ", " / "),
+               lambda g=g: music_game(g), 270, 46, "#f8d0f0")
+    button(0, -150, "My Music Folder (play your own files)", lambda: music_folder(0), 520, 46,
+           "#a8e0a0")
+    text(0, -215, "Searches open YouTube in your browser. The music itself is not stored in this app.",
+         11, "#666", False, "center")
+    button(0, -300, "Back", menu, 200, 38, "#ddd")
+    finish()
+
+
+def open_music_search(query, back):
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
+    try:
+        webbrowser.open(url)
+        msg = ["Opening a search in your browser:", query]
+    except Exception:
+        msg = ["Could not open a browser. Search this on YouTube:", query]
+    notice("Music", msg, back)
+
+
+def music_prompt():
+    q = ask("Music", "Which theme? (e.g. Lavender Town, Route 104, Hoenn Champion battle):")
+    if q:
+        open_music_search("Pokemon " + q + " music", music_home)
+
+
+def music_game(game):
+    page(game.replace(" ", " / ").upper(), "Trainer: " + user)
+    text(0, 225, "Pick a theme to search for", 16, "#222", True, "center")
+    for k, t in enumerate(MUSIC_THEMES):
+        row, c = divmod(k, 2)
+        button(-230 + c * 460, 170 - row * 62, t,
+               lambda t=t: open_music_search("Pokemon %s %s music" % (game, t),
+                                             lambda: music_game(game)),
+               430, 48, "#f8d0f0")
+    button(0, -300, "Back", music_home, 200, 38, "#ddd")
+    finish()
+
+
+def music_folder(pg=0):
+    try:
+        files = sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(AUDIO_EXT))
+    except OSError:
+        files = []
+    per = 12
+    page("MY MUSIC", "%d file(s)" % len(files))
+    if not files:
+        text(0, 150, "No music files yet.", 16, "#222", True, "center")
+        text(0, 115, "Put your own audio files (mp3, wav, ogg, m4a, flac) in this folder:", 13,
+             "#444", False, "center")
+        text(0, 90, MUSIC_DIR, 11, "#444", False, "center")
+    for k, f in enumerate(files[pg * per:(pg + 1) * per]):
+        row, c = divmod(k, 2)
+        button(-230 + c * 460, 215 - row * 50, f[:36],
+               lambda f=f: play_file(f, pg), 430, 40, "#a8e0a0")
+    if pg > 0:
+        button(-330, -300, "< Prev", lambda: music_folder(pg - 1), 150)
+    if (pg + 1) * per < len(files):
+        button(330, -300, "Next >", lambda: music_folder(pg + 1), 150)
+    button(-110, -245, "Open Folder", open_music_folder, 200, 38, "#f8d860")
+    button(110, -245, "Refresh", lambda: music_folder(pg), 200, 38, "#ddd")
+    button(0, -300, "Back", music_home, 200, 38, "#ddd")
+    finish()
+
+
+def open_music_folder():
+    try:
+        open_external(MUSIC_DIR)
+    except Exception as e:
+        notice("Could not open folder", [str(e)[:100], MUSIC_DIR], music_folder)
+
+
+def play_file(name, pg):
+    path = os.path.join(MUSIC_DIR, name)
+    try:
+        open_external(path)
+        notice("Now playing", [name, "Opened in your default music player."],
+               lambda: music_folder(pg))
+    except Exception as e:
+        notice("Could not play", [str(e)[:100]], lambda: music_folder(pg))
 
 
 def team_screen():
@@ -1362,11 +1891,18 @@ def team_add_by_name():
 
 
 def random_team_names(n=6, have=()):
-    ids = random.sample(range(1, 387), n + len(have) + 2)
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        names = list(ex.map(lambda i: get_pokemon(str(i))["name"], ids))
-    names = [x for x in names if x not in have]
-    return names[:n]
+    """Fetch random Pokemon one at a time (cached ones are instant)."""
+    names = []
+    for i in random.sample(range(1, 387), n + len(have) + 2):
+        try:
+            nm = get_pokemon(str(i))["name"]
+        except Exception:
+            continue
+        if nm not in have and nm not in names:
+            names.append(nm)
+        if len(names) == n:
+            break
+    return names
 
 
 def random_fill():
@@ -1399,24 +1935,32 @@ def remove_from(where):
         notice("Not found", [pretty(n) + " is not in your " + where + "."], team_screen)
 
 
-def browse_screen(start=0):
+def browse_screen(start=0, order="num"):
     page("BROWSE ALL POKEMON", "Trainer: " + user)
     loading()
     try:
         names = all_pokemon_names()
     except Exception:
         return notice("Offline", ["Browsing the full list needs internet (first time only)."], menu)
+    if order == "az":
+        names = sorted(names)
     per = 28
-    page("BROWSE ALL POKEMON", "%d-%d of %d" % (start + 1, min(start + per, len(names)), len(names)))
+    page("BROWSE ALL POKEMON", "%d-%d of %d  (%s)" % (
+        start + 1, min(start + per, len(names)), len(names),
+        "A-Z" if order == "az" else "by number"))
     for i, n in enumerate(names[start:start + per]):
         col, row = divmod(i, 14)
-        text(-440 + col * 450, 235 - row * 30, "%d. %s" % (start + i + 1, pretty(n)), 13)
+        label = "%s" % pretty(n) if order == "az" else "%d. %s" % (start + i + 1, pretty(n))
+        text(-440 + col * 450, 235 - row * 30, label, 13)
     if start > 0:
-        button(-330, -300, "< Prev", lambda: browse_screen(max(0, start - per)), 150)
+        button(-330, -300, "< Prev", lambda: browse_screen(max(0, start - per), order), 150)
     if start + per < len(names):
-        button(-110, -300, "Next >", lambda: browse_screen(start + per), 150)
+        button(-110, -300, "Next >", lambda: browse_screen(start + per, order), 150)
     button(110, -300, "Search...", dex_prompt, 150)
     button(330, -300, "Back", menu, 150, 38, "#ddd")
+    other = "num" if order == "az" else "az"
+    button(0, -245, "Sort: %s" % ("by number" if order == "az" else "A-Z"),
+           lambda: browse_screen(0, other), 200, 38, "#e8c8f8")
     finish()
 
 
@@ -1586,9 +2130,10 @@ def build_side(ent):
 
 
 def preload_sprites(sides):
-    jobs = [(m["id"], i == 0) for i, s in enumerate(sides) for m in s["mons"]]
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(lambda j: get_sprite_bytes(*j), jobs))
+    """Download sprites one at a time; cached ones are skipped instantly."""
+    for i, s in enumerate(sides):
+        for m in s["mons"]:
+            get_sprite_bytes(m["id"], i == 0)
 
 
 def start_battle():
@@ -1629,7 +2174,7 @@ def result_screen(p1, p2, winner):
     text(0, 110, "%s defeated %s." % (w[1], l[1]), 18, "#303030", False, "center", font=GBA_FONT)
     if w[0] == "acct" or l[0] == "acct":
         text(0, 60, "Records saved to the trainer accounts.", 14, "#505050", False, "center",
-             font=GBA_FONT)
+            font=GBA_FONT)
     button(-130, -60, "Rematch", battle_setup, 220, 50, "#f8a0a0")
     button(130, -60, "Main Menu", menu, 220, 50)
     finish()
